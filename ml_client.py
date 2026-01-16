@@ -1,11 +1,12 @@
 import asyncio
 import os
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-DEFAULT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 12.0
 MAX_RETRIES = 3
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 REVIEWS_CONCURRENCY = 8
@@ -17,12 +18,34 @@ class MercadoLivreError(Exception):
     message: str
 
 
+def _backoff_seconds(attempt: int) -> float:
+    # Exponential backoff + jitter leve
+    base = min(8.0, 0.5 * (2 ** attempt))
+    return base + random.uniform(0, 0.25)
+
+
 class MercadoLivreClient:
     def __init__(self) -> None:
         self.site_id = os.getenv("ML_SITE_ID", "MLB")
         self.access_token = os.getenv("ML_ACCESS_TOKEN")
         self.base_url = "https://api.mercadolibre.com"
-        self._semaphore = asyncio.Semaphore(REVIEWS_CONCURRENCY)
+        self.semaphore = asyncio.Semaphore(REVIEWS_CONCURRENCY)
+
+    def _default_headers(self) -> Dict[str, str]:
+        # Headers estilo navegador para reduzir 403 em ambientes de cloud (Render/Railway etc.)
+        headers: Dict[str, str] = {
+            "Accept": "application/json",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.mercadolivre.com.br/",
+        }
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        return headers
 
     async def _request(
         self,
@@ -33,106 +56,114 @@ class MercadoLivreClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> httpx.Response:
-        attempt = 0
-        backoff = 0.5
+        merged_headers = self._default_headers()
+        if headers:
+            merged_headers.update(headers)
 
-        while True:
+        for attempt in range(MAX_RETRIES + 1):
             try:
-                response = await client.request(
-                    method,
-                    url,
+                resp = await client.request(
+                    method=method,
+                    url=url,
                     params=params,
-                    headers=headers,
+                    headers=merged_headers,
                     timeout=timeout,
                 )
-            except httpx.TimeoutException as exc:
-                attempt += 1
-                if attempt >= MAX_RETRIES:
+
+                # Retry em rate limit / 5xx
+                if resp.status_code in RETRY_STATUS_CODES:
+                    if attempt == MAX_RETRIES:
+                        return resp
+                    await asyncio.sleep(_backoff_seconds(attempt))
+                    continue
+
+                return resp
+
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt == MAX_RETRIES:
+                    # estoura pro caller decidir (ele vai virar warning)
                     raise exc
-                await asyncio.sleep(backoff)
-                backoff *= 2
-                continue
+                await asyncio.sleep(_backoff_seconds(attempt))
 
-            if response.status_code in RETRY_STATUS_CODES:
-                attempt += 1
-                if attempt >= MAX_RETRIES:
-                    return response
-                await asyncio.sleep(backoff)
-                backoff *= 2
-                continue
-
-            return response
+        # fallback (não deve chegar)
+        return await client.request(method=method, url=url, params=params, headers=merged_headers, timeout=timeout)
 
     async def search_items(self, query: str, limit: int) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/sites/{self.site_id}/search"
+
         async with httpx.AsyncClient() as client:
-            response = await self._request(
+            resp = await self._request(
                 client,
                 "GET",
                 url,
                 params={"q": query, "limit": limit},
             )
 
-        if response.status_code >= 400:
-            raise MercadoLivreError(
-                status_code=response.status_code,
-                message=f"Erro ao buscar itens: {response.text}",
-            )
+            # Se search falhar, levantamos erro pra app decidir como responder
+            if resp.status_code != 200:
+                raise MercadoLivreError(
+                    status_code=resp.status_code,
+                    message=f"Erro ao buscar itens: {resp.text}",
+                )
 
-        data = response.json()
-        items = []
-        for item in data.get("results", []):
-            items.append(
-                {
-                    "id": item.get("id"),
-                    "title": item.get("title"),
-                    "price": item.get("price"),
-                    "image": item.get("thumbnail")
-                    or item.get("secure_thumbnail")
-                    or item.get("thumbnail_id"),
-                }
-            )
+            data = resp.json() or {}
+            results = data.get("results", []) or []
 
-        return items
+            items: List[Dict[str, Any]] = []
+            for item in results[:limit]:
+                items.append(
+                    {
+                        "id": item.get("id"),
+                        "title": item.get("title"),
+                        "price": item.get("price"),
+                        "image": (
+                            item.get("thumbnail")
+                            or item.get("secure_thumbnail")
+                            or item.get("thumbnail_id")  # pode vir id; app/front já lida
+                        ),
+                    }
+                )
+
+            return items
 
     async def get_item_reviews(self, item_id: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Sempre retorna (lista_reviews, warning). Nunca quebra a API final.
+        """
         url = f"{self.base_url}/reviews/item/{item_id}"
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
 
         async with httpx.AsyncClient() as client:
-            response = await self._request(client, "GET", url, headers=headers)
+            try:
+                resp = await self._request(client, "GET", url)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                return [], f"network_error ao buscar reviews ({item_id}): {exc}"
 
-        if response.status_code in {401, 403}:
-            return [], f"Sem permissão para reviews do item {item_id}."
-        if response.status_code == 404:
-            return [], None
-        if response.status_code == 429:
-            return [], f"Rate limit ao buscar reviews do item {item_id}."
-        if response.status_code >= 400:
-            return [], f"Falha ao buscar reviews do item {item_id}: {response.text}"
+            # Regras do desafio: 401/403/404/timeout/429 -> reviews []
+            if resp.status_code in (401, 403):
+                return [], f"forbidden_or_unauthorized ({resp.status_code}) ao buscar reviews ({item_id})"
+            if resp.status_code == 404:
+                return [], None
+            if resp.status_code == 429:
+                return [], f"rate_limited (429) ao buscar reviews ({item_id})"
+            if resp.status_code != 200:
+                return [], f"erro ({resp.status_code}) ao buscar reviews ({item_id})"
 
-        data = response.json()
-        reviews = data.get("reviews", [])
-        if not isinstance(reviews, list):
+            data = resp.json() or {}
+            reviews = data.get("reviews", []) or []
+            if isinstance(reviews, list):
+                return reviews, None
             return [], None
-        return reviews, None
 
     async def _fetch_reviews_with_semaphore(
         self, item: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Optional[str]]:
-        async with self._semaphore:
-            try:
-                reviews, warning = await self.get_item_reviews(item["id"])
-            except httpx.HTTPError as exc:
-                item_with_reviews = {**item, "reviews": []}
-                return (
-                    item_with_reviews,
-                    f"Erro de rede ao buscar reviews do item {item['id']}: {exc}",
-                )
-            item_with_reviews = {**item, "reviews": reviews}
-            return item_with_reviews, warning
+        async with self.semaphore:
+            item_id = item.get("id")
+            if not item_id:
+                return {**item, "reviews": []}, None
+
+            reviews, warning = await self.get_item_reviews(item_id)
+            return {**item, "reviews": reviews or []}, warning
 
     async def attach_reviews(
         self, items: List[Dict[str, Any]]
@@ -142,8 +173,9 @@ class MercadoLivreClient:
 
         items_with_reviews: List[Dict[str, Any]] = []
         warnings: List[str] = []
-        for item, warning in results:
-            items_with_reviews.append(item)
+
+        for item_with_reviews, warning in results:
+            items_with_reviews.append(item_with_reviews)
             if warning:
                 warnings.append(warning)
 
