@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Busca Mercado Livre</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      margin: 0;
+      padding: 24px;
+      color: #222;
+    }
+    header {
+      margin-bottom: 24px;
+    }
+    form {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    input {
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      flex: 1;
+      min-width: 220px;
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      background: #3483fa;
+      color: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+    .card {
+      background: #fff;
+      padding: 16px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .card img {
+      width: 100%;
+      height: 160px;
+      object-fit: cover;
+      border-radius: 8px;
+    }
+    .price {
+      font-weight: bold;
+      color: #3483fa;
+    }
+    pre {
+      background: #111;
+      color: #f5f5f5;
+      padding: 16px;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 360px;
+    }
+    .warnings {
+      margin-top: 16px;
+      padding: 12px;
+      background: #fff4d6;
+      border: 1px solid #ffe6a7;
+      border-radius: 8px;
+      color: #8a6d3b;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Busca Mercado Livre</h1>
+    <p>Busque itens e veja reviews agregadas direto da API.</p>
+  </header>
+  <form id="search-form">
+    <input type="text" id="query" name="query" placeholder="Digite o termo" required />
+    <input type="number" id="limit" name="limit" placeholder="Limite" min="1" max="50" value="10" />
+    <button type="submit">Buscar</button>
+  </form>
+
+  <div id="warnings" class="warnings" hidden></div>
+  <div class="grid" id="results"></div>
+
+  <h2>JSON bruto</h2>
+  <pre id="raw-json">{}</pre>
+
+  <script>
+    const form = document.getElementById("search-form");
+    const results = document.getElementById("results");
+    const rawJson = document.getElementById("raw-json");
+    const warnings = document.getElementById("warnings");
+
+    const formatPrice = (value) =>
+      typeof value === "number"
+        ? value.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })
+        : value;
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const query = document.getElementById("query").value.trim();
+      const limit = document.getElementById("limit").value || 10;
+      if (!query) return;
+
+      results.innerHTML = "";
+      rawJson.textContent = "Carregando...";
+      warnings.hidden = true;
+      warnings.textContent = "";
+
+      try {
+        const response = await fetch(`/search?query=${encodeURIComponent(query)}&limit=${limit}`);
+        const data = await response.json();
+        rawJson.textContent = JSON.stringify(data, null, 2);
+
+        if (data.warnings && data.warnings.length) {
+          warnings.hidden = false;
+          warnings.textContent = data.warnings.join("\n");
+        }
+
+        data.items.forEach((item) => {
+          const card = document.createElement("div");
+          card.className = "card";
+          card.innerHTML = `
+            <img src="${item.image || "https://via.placeholder.com/300x200?text=Sem+imagem"}" alt="${item.title}" />
+            <strong>${item.title}</strong>
+            <span class="price">${formatPrice(item.price)}</span>
+            <span>Reviews: ${item.reviews.length}</span>
+          `;
+          results.appendChild(card);
+        });
+      } catch (error) {
+        rawJson.textContent = `Erro ao buscar: ${error}`;
+      }
+    });
+  </script>
+</body>
+</html>
